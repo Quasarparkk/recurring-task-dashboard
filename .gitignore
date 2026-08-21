@@ -30,11 +30,31 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# ---------------------------------------------------------------------------
+# 환경 변수
+# ---------------------------------------------------------------------------
+# .env 는 비밀정보 없이 기본값만 담고 있으며, 이 파일이 있어야
+# `npm install && npm run dev` 만으로 앱이 뜬다. 따라서 커밋한다.
+#
+# SMTP 비밀번호 등 실제 비밀은 .env.local 에 넣는다.
+# Next.js 는 .env → .env.local 순으로 읽으므로 .env.local 이 우선한다.
 .env*
+!.env
 
 # vercel
 .vercel
+
+# ---------------------------------------------------------------------------
+# 로컬 데이터
+# ---------------------------------------------------------------------------
+# SQLite 데이터베이스 파일 (npm run db:push 로 재생성 가능)
+/prisma/dev.db
+/prisma/dev.db-journal
+/prisma/*.db
+/prisma/*.db-journal
+
+# EMAIL_TRANSPORT="file" 로 저장된 메일 파일
+/.mail-outbox
 
 # typescript
 *.tsbuildinfo

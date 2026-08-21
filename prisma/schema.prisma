@@ -1,0 +1,463 @@
+// ============================================================================
+// 사내 정기 업무 관리 대시보드 — 데이터 모델
+// ============================================================================
+//
+// [핵심 설계 원칙] 업무 정의(Task)와 실제 발생 건(Occurrence)의 분리
+//
+//   Task       : 반복 규칙을 가진 "템플릿"        (예: "매월 5일 급여 마감")
+//   Occurrence : 규칙에 따라 생성된 "개별 실행 건" (예: 2026-03-05 급여 마감)
+//
+//   완료/미완료, 담당자 변경, 메모, 체크리스트는 모두 Occurrence 단위로 기록한다.
+//   Task 의 반복 규칙을 수정해도 이미 확정(완료/건너뜀)된 과거 Occurrence 는
+//   재생성 대상에서 제외되어 변경되지 않는다.
+//
+// ----------------------------------------------------------------------------
+// [날짜 저장 규약] 두 종류의 시간을 명확히 구분한다.
+//
+//   1) 캘린더 날짜 (scheduledDate, originalDate, Holiday.date 등)
+//      → "2026-03-05" 라는 달력상의 날짜 그 자체. 시각 개념이 없다.
+//      → DateTime 컬럼에 UTC 자정(T00:00:00.000Z)으로 저장하며,
+//        연/월/일 값은 Asia/Seoul 기준 달력 날짜를 의미한다.
+//      → 읽을 때는 반드시 UTC getter 를 사용해 연/월/일을 추출한다.
+//        (로컬 타임존에 따라 날짜가 밀리는 버그를 원천 차단하기 위함)
+//      → 관련 유틸: src/lib/date/plain-date.ts
+//
+//   2) 실제 시각 (createdAt, completedAt, sentAt, 알림 발송 시각 등)
+//      → 진짜 순간(instant). UTC 타임스탬프로 저장한다.
+//      → KST 벽시계 시각("09:00")과의 변환은 src/lib/date/kst.ts 가 담당한다.
+//
+// ----------------------------------------------------------------------------
+// [PostgreSQL 전환 고려사항]
+//   SQLite 로 시작하되 PostgreSQL 로 옮길 때 스키마 수정이 없도록 다음을 지킴:
+//   - enum 미사용 (SQLite 미지원) → String + 주석으로 허용값 명시
+//   - 스칼라 배열(String[]) 미사용 (SQLite 미지원) → 별도 모델 또는 JSON 문자열
+//   - provider 별 native type 어트리뷰트(@db.*) 미사용
+//   전환 시에는 datasource.provider 만 "postgresql" 로 교체하면 된다.
+// ============================================================================
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ============================================================================
+// 사용자 / 분류
+// ============================================================================
+
+/// 담당자. 현재는 로그인 없이 시드 데이터로만 관리하지만,
+/// 추후 SSO 연동 시 스키마 변경 없이 확장할 수 있도록 email 을 유니크로 둔다.
+model User {
+  id         String  @id @default(cuid())
+  name       String
+  email      String  @unique
+  department String? // 소속 부서 (예: "경영지원팀")
+  /// 추후 SSO 연동용 외부 식별자. 지금은 사용하지 않음.
+  externalId String? @unique
+  isActive   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ownedTasks    Task[]       @relation("TaskDefaultAssignee")
+  occurrences   Occurrence[] @relation("OccurrenceAssignee")
+  notifications NotificationLog[]
+
+  @@index([isActive])
+}
+
+/// 업무 카테고리 (단일 선택). 예: "결산", "인사/급여", "IT 인프라"
+model Category {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  /// UI 배지 색상. Tailwind 색상 토큰명 또는 HEX.
+  color     String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  tasks Task[]
+}
+
+/// 업무 태그 (복수 선택).
+model Tag {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  color     String?
+  createdAt DateTime @default(now())
+
+  tasks Task[] @relation("TaskTags")
+}
+
+// ============================================================================
+// 업무 정의 (템플릿)
+// ============================================================================
+
+model Task {
+  id            String @id @default(cuid())
+  title         String
+  /// 상세 설명 (Markdown 원문). 업무 절차/주의사항/담당 부서 연락처 등.
+  descriptionMd String @default("")
+
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  tags       Tag[]     @relation("TaskTags")
+
+  /// 기본 담당자. Occurrence 생성 시 이 값이 복사되며, 이후 회차별로 변경 가능.
+  defaultAssigneeId String?
+  defaultAssignee   User?   @relation("TaskDefaultAssignee", fields: [defaultAssigneeId], references: [id], onDelete: SetNull)
+
+  /// 중요도: "HIGH" | "MEDIUM" | "LOW"
+  priority String @default("MEDIUM")
+
+  /// 예상 소요 시간(시간 단위). 선택 입력.
+  estimatedHours Float?
+
+  /// 반복 규칙 설정 전체. RecurrenceConfig 를 JSON 문자열로 직렬화해 저장.
+  /// 스키마 정의: src/lib/recurrence/types.ts
+  /// (RRULE 문자열 대신 자체 판별 유니온 JSON 을 쓰는 이유는 DECISIONS.md 참고)
+  recurrenceConfig String
+
+  /// 이 Task 의 Occurrence 가 어느 캘린더 날짜까지 생성되었는지 기록.
+  /// 롤링 윈도우 배치가 "여기서부터 이어서" 생성하기 위한 워터마크.
+  /// (캘린더 날짜 규약 적용 — UTC 자정)
+  generatedUntil DateTime?
+
+  /// 다음 회차에 부여할 회차 번호. 규칙을 바꿔 재생성해도 번호가 겹치지 않게 관리.
+  nextSequenceIndex Int @default(0)
+
+  /// false 로 두면 신규 Occurrence 를 생성하지 않는다(보관 처리).
+  /// 기존 Occurrence 는 유지된다.
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  occurrences       Occurrence[]
+  referenceLinks    ReferenceLink[]
+  checklistTemplate ChecklistTemplateItem[]
+  notificationRules NotificationRule[]
+
+  /// 이 Task 를 후행으로 갖는 의존 관계 (= 이 Task 의 선행 목록)
+  predecessorLinks TaskDependency[] @relation("DependencyAsSuccessor")
+  /// 이 Task 를 선행으로 갖는 의존 관계 (= 이 Task 의 후행 목록)
+  successorLinks   TaskDependency[] @relation("DependencyAsPredecessor")
+
+  @@index([isActive])
+  @@index([categoryId])
+  @@index([defaultAssigneeId])
+  @@index([priority])
+}
+
+/// 참고 링크. Task 당 여러 개 첨부 가능.
+model ReferenceLink {
+  id        String @id @default(cuid())
+  taskId    String
+  task      Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label     String
+  url       String
+  sortOrder Int    @default(0)
+
+  @@index([taskId])
+}
+
+/// 체크리스트 템플릿 항목. Occurrence 생성 시 ChecklistItem 으로 복제된다.
+/// 템플릿을 수정해도 이미 생성된 Occurrence 의 체크리스트는 변경되지 않는다.
+model ChecklistTemplateItem {
+  id        String  @id @default(cuid())
+  taskId    String
+  task      Task    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  title     String
+  /// 필수 항목이면 true. 미완료 시 완료 처리를 경고한다.
+  isRequired Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  @@index([taskId])
+}
+
+// ============================================================================
+// 의존 관계 (DAG)
+// ============================================================================
+
+/// Task 레벨 의존 관계. 반복되는 업무 사이의 상시적인 선후 관계를 나타낸다.
+/// 예: "급여 마감"(선행) → "급여 이체"(후행)
+///
+/// 실제 Occurrence 끼리의 매칭 방식은 matchStrategy 로 결정한다.
+/// 순환 참조는 등록 시점에 차단한다. (src/lib/dependency/graph.ts)
+model TaskDependency {
+  id String @id @default(cuid())
+
+  predecessorId String
+  predecessor   Task   @relation("DependencyAsPredecessor", fields: [predecessorId], references: [id], onDelete: Cascade)
+
+  successorId String
+  successor   Task   @relation("DependencyAsSuccessor", fields: [successorId], references: [id], onDelete: Cascade)
+
+  /// 선행 완료 후 후행 시작까지의 지연(lag).
+  lagAmount Int    @default(0)
+  /// "BUSINESS_DAY" (영업일, 주말·공휴일 제외) | "CALENDAR_DAY" (달력일)
+  lagUnit   String @default("BUSINESS_DAY")
+
+  /// 후행 Occurrence 에 대응하는 선행 Occurrence 를 찾는 규칙.
+  ///   "SAME_SEQUENCE"    : 같은 회차 번호끼리 매칭 (주기가 동일할 때 기본값)
+  ///   "NEAREST_PRECEDING": 후행 예정일 이전(또는 같은 날) 중 가장 가까운 선행 회차
+  ///   "SAME_PERIOD"      : 같은 달(월 단위)에 속한 선행 회차
+  matchStrategy String @default("NEAREST_PRECEDING")
+
+  /// true 면 선행 미완료 시 후행을 BLOCKED 로 표시한다.
+  /// false 면 관계만 시각화하고 상태 계산에는 반영하지 않는다(참고용 연결).
+  isBlocking Boolean @default(true)
+
+  note String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([predecessorId, successorId])
+  @@index([predecessorId])
+  @@index([successorId])
+}
+
+/// 특정 회차끼리 직접 연결하는 예외 규칙.
+/// 주기가 서로 다른 업무를 잇거나, 특정 회차만 다른 회차에 의존시킬 때 사용.
+/// 동일한 후행 Occurrence 에 대해 이 오버라이드가 존재하면
+/// TaskDependency 의 자동 매칭보다 우선 적용된다.
+model OccurrenceDependencyOverride {
+  id String @id @default(cuid())
+
+  predecessorOccurrenceId String
+  predecessorOccurrence   Occurrence @relation("OverrideAsPredecessor", fields: [predecessorOccurrenceId], references: [id], onDelete: Cascade)
+
+  successorOccurrenceId String
+  successorOccurrence   Occurrence @relation("OverrideAsSuccessor", fields: [successorOccurrenceId], references: [id], onDelete: Cascade)
+
+  lagAmount Int     @default(0)
+  lagUnit   String  @default("BUSINESS_DAY")
+  isBlocking Boolean @default(true)
+  note      String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([predecessorOccurrenceId, successorOccurrenceId])
+  @@index([predecessorOccurrenceId])
+  @@index([successorOccurrenceId])
+}
+
+// ============================================================================
+// 발생 건 (실제 실행 단위)
+// ============================================================================
+
+model Occurrence {
+  id     String @id @default(cuid())
+  taskId String
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  /// Task 내 회차 번호(0부터). 1회성 예외 규칙 및 SAME_SEQUENCE 매칭의 기준.
+  sequenceIndex Int
+
+  /// 반복 규칙으로 계산된 원본 마감일 (공휴일 보정 및 예외 적용 전).
+  /// 캘린더 날짜 규약 적용.
+  originalDate DateTime
+
+  /// 최종 마감일. 공휴일/주말 보정과 1회성 예외(날짜 변경)가 반영된 값.
+  /// 캘린더 날짜 규약 적용.
+  scheduledDate DateTime
+
+  /// 마감일이 원본에서 이동한 이유.
+  /// null | "HOLIDAY_BEFORE" | "HOLIDAY_AFTER" | "EXCEPTION_RESCHEDULE"
+  shiftReason String?
+
+  /// 저장되는 상태값: "PENDING" | "IN_PROGRESS" | "DONE" | "SKIPPED"
+  ///
+  /// 주의: "BLOCKED"(선행 미완료)와 "OVERDUE"(마감일 초과)는 DB 에 저장하지 않는다.
+  ///       선행 완료 여부와 현재 날짜에 따라 매 순간 달라지는 파생 상태이므로,
+  ///       저장하면 즉시 낡은 값이 된다. 조회 시 계산한다.
+  ///       (src/lib/dependency/status.ts)
+  status String @default("PENDING")
+
+  assigneeId String?
+  assignee   User?   @relation("OccurrenceAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  /// 회차별 메모.
+  memo String?
+
+  /// 실제 완료 시각 (instant).
+  completedAt DateTime?
+  /// 실제 착수 시각 (instant).
+  startedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checklist        ChecklistItem[]
+  notificationLogs NotificationLog[]
+
+  overridesAsPredecessor OccurrenceDependencyOverride[] @relation("OverrideAsPredecessor")
+  overridesAsSuccessor   OccurrenceDependencyOverride[] @relation("OverrideAsSuccessor")
+
+  /// 같은 Task 안에서 회차 번호는 유일하다.
+  @@unique([taskId, sequenceIndex])
+  @@index([scheduledDate])
+  @@index([status])
+  @@index([assigneeId])
+  @@index([taskId, scheduledDate])
+}
+
+/// Occurrence 별 체크리스트. 생성 시 ChecklistTemplateItem 을 복제하며
+/// 이후 템플릿 변경에 영향받지 않는다.
+model ChecklistItem {
+  id           String     @id @default(cuid())
+  occurrenceId String
+  occurrence   Occurrence @relation(fields: [occurrenceId], references: [id], onDelete: Cascade)
+
+  title      String
+  isRequired Boolean   @default(false)
+  isChecked  Boolean   @default(false)
+  checkedAt  DateTime?
+  sortOrder  Int       @default(0)
+
+  @@index([occurrenceId])
+}
+
+// ============================================================================
+// 알림
+// ============================================================================
+
+/// 업무별 알림 규칙. Task 당 여러 개 등록 가능.
+/// 예: (offsetDays: -7, timeOfDay: "09:00") → 마감 7일 전 오전 9시
+model NotificationRule {
+  id     String @id @default(cuid())
+  taskId String
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  /// 마감일 기준 오프셋(일). 음수 = 마감 전, 0 = 당일, 양수 = 마감 후.
+  offsetDays Int
+  /// 발송 시각 (KST 벽시계, "HH:mm").
+  timeOfDay  String @default("09:00")
+
+  /// 오프셋 계산 단위: "CALENDAR_DAY" | "BUSINESS_DAY"
+  offsetUnit String @default("CALENDAR_DAY")
+
+  /// 발송 채널 목록. JSON 문자열 배열. 예: ["WEB_PUSH","EMAIL"]
+  /// 허용값은 어댑터 레지스트리가 결정한다. (src/lib/notification/registry.ts)
+  channels String @default("[\"WEB_PUSH\"]")
+
+  /// 마감일 초과 후 미완료 리마인더를 반복 발송할지 여부.
+  /// true 인 경우 offsetDays/timeOfDay 대신 아래 반복 설정을 사용한다.
+  isOverdueReminder   Boolean @default(false)
+  /// 반복 간격(시간).
+  repeatIntervalHours Int?
+  /// 최대 반복 횟수. null 이면 무제한(완료될 때까지).
+  maxRepeats          Int?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([taskId])
+  @@index([isActive])
+}
+
+/// 알림 발송 이력. 중복 발송 방지의 근거가 되는 테이블.
+///
+/// dedupeKey 규칙 (src/lib/notification/dedupe.ts):
+///   정기 알림  : "rule:<ruleId>:occ:<occurrenceId>:<channel>:<발송예정시각ISO>"
+///   지연 리마인더: "overdue:<ruleId>:occ:<occurrenceId>:<channel>:<슬롯번호>"
+///   선행완료 알림: "unblocked:<predOccId>:occ:<occurrenceId>:<channel>"
+model NotificationLog {
+  id String @id @default(cuid())
+
+  occurrenceId String
+  occurrence   Occurrence @relation(fields: [occurrenceId], references: [id], onDelete: Cascade)
+
+  /// 수신자. 발송 시점의 담당자를 기록해 둔다(이후 담당자 변경과 무관하게 이력 보존).
+  recipientId    String?
+  recipient      User?   @relation(fields: [recipientId], references: [id], onDelete: SetNull)
+  /// 발송 시점의 수신 주소 스냅샷 (이메일 주소 등).
+  recipientAddr  String?
+
+  /// 채널 식별자. 예: "WEB_PUSH" | "EMAIL" | "SLACK" | "TEAMS"
+  channel String
+  /// 알림 종류: "SCHEDULED" | "OVERDUE_REMINDER" | "DEPENDENCY_UNBLOCKED"
+  kind    String
+
+  /// 중복 발송 방지 키. 유니크 제약으로 동일 알림의 재발송을 원천 차단한다.
+  dedupeKey String @unique
+
+  /// 발송이 예정되었던 시각 (instant).
+  plannedAt DateTime
+  /// 실제 발송 시각 (instant). 미발송 상태면 null.
+  sentAt    DateTime?
+
+  /// "SENT" | "FAILED" | "SKIPPED_STALE"
+  ///   SKIPPED_STALE: 서버 정지 등으로 너무 오래 지난 알림을 폐기한 경우.
+  status   String @default("SENT")
+  attempts Int    @default(1)
+  error    String?
+
+  title String
+  body  String
+
+  /// 웹 알림 전용: 사용자가 브라우저에서 확인했는지 여부.
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([occurrenceId])
+  @@index([recipientId])
+  @@index([status])
+  @@index([channel, plannedAt])
+  @@index([readAt])
+}
+
+// ============================================================================
+// 공휴일 / 영업일
+// ============================================================================
+
+/// 대한민국 공휴일 및 사내 휴무일.
+/// 음력 기반 공휴일(설날·추석·석가탄신일)은 매년 날짜가 달라지므로
+/// 절대 하드코딩하지 않고 data/holidays/<연도>.json 에서 시드한다.
+model Holiday {
+  id String @id @default(cuid())
+
+  /// "YYYY-MM-DD" (Asia/Seoul 기준 달력 날짜). 문자열로 두어 조회·시드가 단순하다.
+  date String @unique
+  /// 조회 성능을 위한 비정규화 컬럼.
+  year Int
+
+  name String
+
+  /// "PUBLIC"  : 법정공휴일
+  /// "SUBSTITUTE": 대체공휴일
+  /// "TEMPORARY" : 임시공휴일
+  /// "COMPANY" : 사내 휴무일(창립기념일 등)
+  type String @default("PUBLIC")
+
+  /// 데이터 출처 메모. 예: "data/holidays/2026.json"
+  source String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([year])
+  @@index([type])
+}
+
+// ============================================================================
+// 애플리케이션 설정
+// ============================================================================
+
+/// 전역 설정 키-값 저장소.
+/// 사용 키:
+///   "rollingWindowMonths" : Occurrence 를 미리 생성해 둘 개월 수 (기본 18)
+///   "currentUserId"       : 로그인 기능이 없는 동안 "나"로 취급할 사용자 ID
+///   "staleNotificationHours": 이 시간 이상 지난 알림은 발송하지 않고 폐기 (기본 48)
+///   "lastGenerationRunAt" : 마지막 Occurrence 생성 배치 실행 시각
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
