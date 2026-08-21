@@ -148,7 +148,7 @@ Task (업무 정의 = 템플릿)          Occurrence (발생 건 = 실제 실행
 | 날짜 처리 | `date-fns` + `@date-fns/utc` + `@date-fns/tz` | Temporal 폴리필 대신 |
 | 검증 | Zod | |
 | 스케줄러 | `node-cron` + Next.js `instrumentation.ts` | 별도 워커 프로세스 불필요 |
-| 테스트 | Vitest | 228개 단위 테스트 |
+| 테스트 | Vitest | 248개 단위 테스트 |
 
 ---
 
@@ -212,7 +212,7 @@ npm test           # 1회 실행
 npm run test:watch # 감시 모드
 ```
 
-**228개 테스트**가 다음을 검증합니다.
+**248개 테스트**가 다음을 검증합니다.
 
 | 파일 | 검증 내용 |
 |---|---|
@@ -222,6 +222,7 @@ npm run test:watch # 감시 모드
 | `graph.test.ts` | 순환 탐지(직접·간접·자기참조), 위상 정렬, 그래프 레이아웃 |
 | `status.test.ts` | 회차 매칭 3전략, blocked 판정, lag 기반 지연 영향 분석 |
 | `planner.test.ts` | 알림 시점 계산, 서버 재시작 후 재개, 낡은 알림 폐기, 지연 리마인더 폭주 방지 |
+| `describe.test.ts` | 규칙 → 한국어 문구 변환, "날짜 없는 달" 판정 |
 
 ### 타임존 안전성 검증
 
@@ -382,8 +383,15 @@ export const slackAdapter: NotificationChannelAdapter = {
 
 ---
 
-## 참고
+## 문서
 
-- 설계 결정과 그 근거: [`DECISIONS.md`](DECISIONS.md) — 26개 항목
-- 공휴일 데이터 갱신 절차: [`data/holidays/README.md`](data/holidays/README.md)
-- 데이터 모델: [`prisma/schema.prisma`](prisma/schema.prisma) — 한국어 주석 포함
+| 문서 | 내용 |
+|---|---|
+| `README.md` (이 문서) | 앱을 **쓰는 법** — 설치, 기능, 운영 |
+| [`HANDOFF.md`](HANDOFF.md) | **이어받는 사람을 위한 인수인계** — 깨뜨리면 안 되는 불변식, 환경 함정, 미완성 부분, 개선 우선순위 |
+| [`DECISIONS.md`](DECISIONS.md) | 왜 그렇게 **설계했는지** — 26개 항목, 검토했지만 채택하지 않은 대안 포함 |
+| [`data/holidays/README.md`](data/holidays/README.md) | 공휴일 데이터 갱신 절차, 대체공휴일 규칙표 |
+| [`prisma/schema.prisma`](prisma/schema.prisma) | 데이터 모델 (한국어 주석 포함) |
+
+> **코드를 수정하기 전에 [`HANDOFF.md`](HANDOFF.md) 의 3절 "절대 깨뜨리면 안 되는 불변식"을 먼저 읽으세요.**
+> 어기면 컴파일은 되지만 조용히 잘못된 결과를 내는 항목들입니다.
